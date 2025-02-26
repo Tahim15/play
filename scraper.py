@@ -1,14 +1,10 @@
 import os
-import uuid
-import shutil
-import time
 import json
-import random
 import logging
 import asyncio
 import requests
 from config import *
-from pyrogram import *
+from pyrogram import Client, enums
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
@@ -72,18 +68,27 @@ async def extract_download_links(movie_url):
 
 async def get_direct_hubcloud_link(hubcloud_url, max_retries=5):
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-gpu",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding"
+            ]
+        )
         page = await browser.new_page()
         try:
             logging.info(f"🖇️ Opening {hubcloud_url}...")
-            await page.goto(hubcloud_url, wait_until="load")
-            await page.wait_for_selector("body", timeout=20000)  # Ensure the page has loaded
+            await page.goto(hubcloud_url, wait_until="domcontentloaded", timeout=30000)
             logging.info("✅ Page is fully loaded.")
 
             retries = 0
             file_name = "Unknown File"
 
-            # Get file name (if available)
             try:
                 file_name_element = await page.query_selector("div.card-header")
                 if file_name_element:
@@ -103,7 +108,7 @@ async def get_direct_hubcloud_link(hubcloud_url, max_retries=5):
                         if download_button:
                             logging.info("✅ Found 'Download' Button. Clicking...")
                             await download_button.click()
-                            await page.wait_for_navigation(timeout=20000)  # Wait for the next page to load
+                            await page.wait_for_load_state("domcontentloaded", timeout=20000)
                         else:
                             logging.warning("⚠️ Download button not found!")
                             retries += 1
@@ -113,7 +118,6 @@ async def get_direct_hubcloud_link(hubcloud_url, max_retries=5):
                         retries += 1
                         continue
 
-                # After clicking, wait for the final page to load and get the download links
                 try:
                     final_buttons = await page.query_selector_all("a.btn")
                     final_links = [
@@ -141,31 +145,10 @@ async def get_direct_hubcloud_link(hubcloud_url, max_retries=5):
         finally:
             await browser.close()
 
-def get_movie_links():
-    try:
-        response = requests.get(SKYMOVIESHD_URL, headers=HEADERS)
-        if response.status_code != 200:
-            logging.error(f"Failed to load SkyMoviesHD (Status Code: {response.status_code})")
-            return []
-        soup = BeautifulSoup(response.text, "html.parser")
-        movie_links = []
-        for movie in soup.find_all("div", class_="Fmvideo"):
-            a_tag = movie.find('a')
-            if a_tag:
-                title = a_tag.text.strip()
-                movie_url = a_tag['href']
-                if not movie_url.startswith("http"):
-                    movie_url = SKYMOVIESHD_URL.rstrip("/") + "/" + movie_url.lstrip("/")
-                movie_links.append({"title": title, "link": movie_url})        
-        return movie_links
-    except Exception as e:
-        logging.error(f"Error getting movie links: {e}")
-        return []
-
 async def scrape_skymovieshd(client):
     posted_movies = load_posted_movies() 
     movies = get_movie_links()     
-    for index, movie in enumerate(movies, start=1):
+    for movie in movies:
         if movie['title'] in posted_movies:
             logging.info(f"⏩ Skipping {movie['title']} (Already Posted)")
             continue 
@@ -174,20 +157,13 @@ async def scrape_skymovieshd(client):
         if not direct_links:
             logging.warning(f"⚠️ No Valid Download Links Found For {movie['title']}.")
             continue
-        message = f"<b>Recently Posted Movie ✅</b>\n\n"
-        message += f"<b>{movie['title']}</b>\n\n"
-        message += f"<b>Download Links:</b>\n\n"
+        message = f"<b>Recently Posted Movie ✅</b>\n\n<b>{movie['title']}</b>\n\n<b>Download Links:</b>\n\n"
         for data in direct_links:
             if isinstance(data, dict) and "file_name" in data and "download_links" in data:
                 file_name = data["file_name"]
                 download_links = data["download_links"]
                 message += f"<b>{file_name}</b>\n"
-                if download_links:
-                    for i, link in enumerate(download_links, start=1):
-                        message += f"{i}. {link}\n"
-                else:
-                    message += "❌ No Download Links Available\n"
-                message += "\n"
+                message += "\n".join([f"{i}. {link}" for i, link in enumerate(download_links, start=1)]) + "\n\n"
         try:
             await client.send_message(chat_id=CHANNEL_ID, text=message, disable_web_page_preview=True, parse_mode=enums.ParseMode.HTML)
             logging.info(f"✅ Posted: {movie['title']}")
@@ -196,10 +172,9 @@ async def scrape_skymovieshd(client):
         except Exception as e:
             logging.error(f"❌ Failed To Post {movie['title']}: {e}")
         await asyncio.sleep(3)
-        
+
 async def check_new_movies(client):
     while True:
         logging.info("Checking for new movies...")
         await scrape_skymovieshd(client) 
         await asyncio.sleep(CHECK_INTERVAL)
-
